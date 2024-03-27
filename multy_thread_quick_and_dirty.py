@@ -6,13 +6,14 @@ import psycopg2
 import time
 import random
 from passwords import host_name, database_name, user_name, password_name
+import multiprocessing as mp
 
 
-def allrecipes_data_extraction(soup, link):
+def allrecipes_data_extraction(soup, link, link_insert_lock):
     ingredients_elements = soup.find_all("li", class_="mntl-structured-ingredients__list-item")
     steps_elements_general = soup.find("div", class_="comp recipe__steps-content mntl-sc-page mntl-block")
     steps_elements = steps_elements_general.find_all("p", class_="comp mntl-sc-block mntl-sc-block-html")
-    link_elements = soup.find_all("a", class_="comp mntl-card-list-items mntl-document-card mntl-card card card--no-image")
+    link_elements = soup.find_all("a")
     title = soup.find("h1", class_="comp type--lion article-heading mntl-text-block")
     rate = soup.find("div", class_="comp type--squirrel-bold mntl-recipe-review-bar__rating mntl-text-block")
     rating_set = ""
@@ -20,7 +21,7 @@ def allrecipes_data_extraction(soup, link):
         rating_set = rate.text.strip()
     except Exception as error:
         rating_set = "no rating"
-        print(f'Rating Does not exist {error}')
+        print(f"Rating Does not exist {error}", flush=True)
 
     data = {
     "title": title.text.strip(),
@@ -31,26 +32,35 @@ def allrecipes_data_extraction(soup, link):
     "rating": rating_set,
     "source_url":link
     }
+
     links = []
+
     for lin in link_elements:
-        links_to_insert = re.findall("https://www.allrecipes.com/recipe/.*/", str(lin))
+        links_to_insert = re.findall("https://www.allrecipes.com/.*\" i", str(lin))
         if links_to_insert != []:
             links.append(links_to_insert)
-
     if len(links) > 0:
-        # print(links)
         for lin in links:
-            # print(f"links link link {link}")
-            # print(lin)
-            if re.fullmatch('https://www.allrecipes.com/article/.*', lin[0]):
-                print(f"article link skipped {lin[0]}")
-            elif re.fullmatch('https://www.allrecipes.com/.*recipe.*', lin[0]):
-                
-                if not(re.fullmatch('https://www.allrecipes.com/gallery/.*', lin[0])):
-                    # print(re.fullmatch('https://www.allrecipes.com/gallery/.*', lin[0]))
-                    insert_new_link(lin[0])
-                else:
-                    insert_new_link_gallery(lin[0])
+            curr_link = lin[0].replace("\" i","")
+            if re.fullmatch('https://www.allrecipes.com/article/.*', curr_link):
+                print(f'Artical Link skipped {curr_link}')
+            elif re.fullmatch('https://www.allrecipes.com/.*recipe.*', curr_link):
+                if not(re.fullmatch('https://www.allrecipes.com/gallery/.*', curr_link)):
+                    if not(re.fullmatch('https://www.allrecipes.com/recipes/.*', curr_link)):
+                        link_insert_lock.acquire(True, 1)
+                        insert_new_link(curr_link)
+                        link_insert_lock.release()
+                elif not(re.fullmatch('https://www.allrecipes.com/recipes/.*', curr_link)):
+                    link_insert_lock.acquire(True, 1)
+                    insert_new_link_gallery(curr_link)
+                    link_insert_lock.release()
+
+            elif re.fullmatch('https://www.allrecipes.com/gallery/.*', curr_link):
+                link_insert_lock.acquire(True, 1)
+                insert_new_link_gallery(curr_link)
+                link_insert_lock.release()
+    
+
     else:
         print(f"No links given on {link}")
 
@@ -59,7 +69,6 @@ def allrecipes_data_extraction(soup, link):
 
     for i in steps_elements:
         data['steps'].append(i.text.strip())
-    
     return(data)
 
     
@@ -78,6 +87,7 @@ def insert_new_link_gallery(link):
         test = f"select * from recipie_websites_gallery where website = '{link}';"
         cur.execute(test)
         if cur.rowcount == 0:
+            print(f"gallery insert {link}", flush=True)
             cur2.execute(f"INSERT INTO recipie_websites_gallery (website, visited) VALUES('{link}', false);")
             conn.commit()
         cur2.close()
@@ -101,7 +111,7 @@ def insert_new_link(link):
         test = f"select * from recipie_websites where website = '{link}';"
         cur.execute(test)
         if cur.rowcount == 0:
-            print(f"added {link}")
+            print(f"added recipie {link}")
             cur2.execute(f"INSERT INTO recipie_websites (website, visited) VALUES('{link}', false);")
             conn.commit()
         cur2.close()
@@ -122,7 +132,7 @@ def get_links():
             user=user_name,
             password=password_name)
         cur = conn.cursor()
-        cur.execute("select * from recipie_websites where visited = false")
+        cur.execute("select * from recipie_websites where (visited = false or re_visit = true)")
         row = cur.fetchone()
         recipe_links_with_index = []
         while row is not None:
@@ -151,7 +161,9 @@ def update_data(data, key):
         cur = conn.cursor()
         data_with_replacement = data.replace("\'", "\'\'")
         # print(data_with_replacement)
-        cur.execute(f"update recipie_websites set visited = true, recipie = '{data_with_replacement}' where key = {key}")
+        # print(f"update {key}")
+
+        cur.execute(f"update recipie_websites set visited = true, re_visit = false, recipie = '{data_with_replacement}' where key = {key}")
         conn.commit()
 
         cur.close()
@@ -166,7 +178,7 @@ def gallery_data_extraction(soup):
     # print(link_elements)
     links = []
     for lin in link_elements:
-        # print(lin)
+
         links_to_insert = re.findall("href=\"https://www.allrecipes.com/.*\" ", str(lin))
         # print(links_to_insert)
         # Links Insert
@@ -184,14 +196,16 @@ def gallery_data_extraction(soup):
             if re.fullmatch('https://www.allrecipes.com/article/.*', curr_link):
                 print(f'Artical Link skipped {curr_link}')
             elif re.fullmatch('https://www.allrecipes.com/.*recipe.*', curr_link):
-
-                if not(re.fullmatch('https://www.allrecipes.com/gallery/.*', curr_link)):
-                    # print(re.fullmatch('https://www.allrecipes.com/gallery/.*', lin[0]))
-                    # print(lin[0].replace("\"",""))
-                    insert_new_link(curr_link)
-                else:
-                    # print(lin[0].replace("\"",""))
+                if re.fullmatch('https://www.allrecipes.com/gallery/.*', curr_link):
                     insert_new_link_gallery(curr_link)
+                elif not(re.fullmatch('https://www.allrecipes.com/recipes/.*', curr_link)):
+                    insert_new_link(curr_link)
+
+                    
+            elif re.fullmatch('https://www.allrecipes.com/gallery/.*', curr_link):
+                insert_new_link_gallery(curr_link)
+
+
 
 
 def check_gallery_links(link_key):
@@ -203,13 +217,12 @@ def check_gallery_links(link_key):
             password=password_name)
         cur = conn.cursor()
         for website in link_key:
-            # print(website)
             page = requests.get(website[0])
             soup = BeautifulSoup(page.content, "html.parser")
             # print(link[0])
             gallery_data_extraction(soup)
-            # print(f"update recipie_websites_gallery set visited = true, website = '{website[0]}' where key = {website[1]}")
-            cur.execute(f"update recipie_websites_gallery set visited = true, website = '{website[0]}' where key = {website[1]}")
+            print(f"update {website[1]}")
+            cur.execute(f"update recipie_websites_gallery set visited = true, re_visit = false where key = {website[1]}")
         conn.commit()
 
         cur.close()
@@ -227,7 +240,7 @@ def gallery_info():
             user=user_name,
             password=password_name)
         cur = conn.cursor()
-        cur.execute("select * from recipie_websites_gallery where visited = false")
+        cur.execute("select * from recipie_websites_gallery where visited = false or re_visit = true")
         row = cur.fetchone()
         gallery_links_with_index = []
         while row is not None:
@@ -245,23 +258,49 @@ def gallery_info():
             conn.close()
         check_gallery_links(gallery_links_with_index)
 
+def mult_thread(link, link_insert_lock, i):
+    # print(f"Started {link}", flush=True)
+    if i % 1000 == 0:
+        print(f"Started {i}", flush=True)
+
+    page = requests.get(link[0])
+    # print(page, flush=True)
+    soup = BeautifulSoup(page.content, "html.parser")
+    # print(soup, flush=True)
+
+    # print("before data extraction", flush=True)
+    data = allrecipes_data_extraction(soup, link[0], link_insert_lock)
+    # print("after data extraction", flush=True)
+
+    # print(data, flush=True)
+    json_data = json.dumps(data)
+    # print(json_data, flush=True)
+    update_data(json_data, link[1])
+    # print(f"Finished {i} {link}", flush=True)
+
+    
 
 def main():
     continue_going = True
     times_though = 0
     items_gone_through = 0
+    m = mp.Manager()
+    link_insert_lock = m.Lock()
+
+    # link_insert_lock = mp.Lock()
     while continue_going:
         Links = get_links()
+        # print(mp.cpu_count())
+        value_pool = mp.Pool(mp.cpu_count()+20)
+        i = 1
         for link in Links:
-            page = requests.get(link[0])
-            soup = BeautifulSoup(page.content, "html.parser")
-            # print(link[0])
-            data = allrecipes_data_extraction(soup, link[0])
-            json_data = json.dumps(data)
-            update_data(json_data, link[1])
-            time.sleep(random.randint(2, 4))       
+            
+            value_pool.apply_async(mult_thread, args = (link, link_insert_lock, i, ))
+            i = i + 1
+        value_pool.close()
+        value_pool.join()
+        print("After join")
         gallery_info()
-
         if len(Links) <= 0:
             continue_going = False 
 
